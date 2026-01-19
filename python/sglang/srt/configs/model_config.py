@@ -1326,6 +1326,7 @@ multimodal_model_archs = [
     "DotsVLMForCausalLM",
     "DotsOCRForCausalLM",
     "Sarashina2VisionForCausalLM",
+    "Eagle2_5_VLForConditionalGeneration",
     "NVILAForConditionalGeneration",
     "NVILALiteForConditionalGeneration",
     "DeepseekOCRForCausalLM",
