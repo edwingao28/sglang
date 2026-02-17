@@ -1,12 +1,13 @@
 # Adapted from https://huggingface.co/OpenGVLab/InternVL2-4B/blob/main/modeling_intern_vit.py
 
+import asyncio
 import logging
+import os
 from functools import lru_cache
 from typing import List
 
 import numpy as np
 import torch
-from decord import VideoReader, cpu, gpu
 from PIL import Image
 
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
@@ -16,8 +17,13 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.processors.internvl_video_worker import (
+    extract_video_frames,
+)
 
 logger = logging.getLogger(__name__)
+
+_INTERNVL_ASYNC_VL = os.environ.get("SGLANG_INTERNVL_ASYNC_VL", "0") == "1"
 
 
 class InternVLProcessor(BaseMultimodalProcessor):
@@ -192,16 +198,6 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         return torch.stack(tiles).to(torch.bfloat16)
 
-    @staticmethod
-    def _open_video_reader(path: str) -> VideoReader:
-        try:
-            return VideoReader(path, ctx=gpu(0), num_threads=1)
-        except (RuntimeError, OSError) as e:
-            logger.warning(
-                "[internvl] VideoReader gpu decode failed (%s), fallback CPU", e
-            )
-            return VideoReader(path, ctx=cpu(0), num_threads=1)
-
     def _ensure_placeholders_before_assistant(
         self, prompt: str, placeholder: str, want: int
     ) -> str:
@@ -310,13 +306,22 @@ class InternVLProcessor(BaseMultimodalProcessor):
             prompt.count(self.VIDEO_PLACEHOLDER_TOKEN),
         )
 
-        base_output = self.load_mm_data(
-            prompt=prompt,
-            image_data=image_data,
-            video_data=video_data,
-            multimodal_tokens=self.mm_tokens,  # expects <image>/<video>
-            discard_alpha_channel=True,
-        )
+        if _INTERNVL_ASYNC_VL:
+            base_output = await self.load_mm_data_async(
+                prompt=prompt,
+                image_data=image_data,
+                video_data=video_data,
+                multimodal_tokens=self.mm_tokens,
+                discard_alpha_channel=True,
+            )
+        else:
+            base_output = self.load_mm_data(
+                prompt=prompt,
+                image_data=image_data,
+                video_data=video_data,
+                multimodal_tokens=self.mm_tokens,  # expects <image>/<video>
+                discard_alpha_channel=True,
+            )
 
         logger.info(
             "[internvl][qwen] loaded images=%d videos=%d",
@@ -371,33 +376,35 @@ class InternVLProcessor(BaseMultimodalProcessor):
         )
 
         if base_output.videos and num_frames > 0 and self.video_token_id is not None:
-            for video in base_output.videos:
-                vr = (
-                    video
-                    if isinstance(video, VideoReader)
-                    else self._open_video_reader(str(video))
-                )
-                max_frame = len(vr) - 1
-                frame_indices = (
-                    [0]
-                    if num_frames == 1
-                    else np.linspace(0, max_frame, num=num_frames, dtype=int).tolist()
-                )
+            # Extract frames — async (parallel via executor) or sync
+            if _INTERNVL_ASYNC_VL and self.video_executor is not None:
+                loop = asyncio.get_running_loop()
+                frame_tasks = [
+                    loop.run_in_executor(
+                        self.video_executor,
+                        extract_video_frames,
+                        video,
+                        num_frames,
+                    )
+                    for video in base_output.videos
+                ]
+                all_frames_lists = await asyncio.gather(*frame_tasks)
+            else:
+                all_frames_lists = [
+                    extract_video_frames(video, num_frames)
+                    for video in base_output.videos
+                ]
 
+            # GPU processing: normalise + dynamic tiling (shared path)
+            for frames_np in all_frames_lists:
                 per_video_tiles = []
                 per_video_patch_cnt = []
-                for fi in frame_indices:
-                    frame = vr[int(fi)]
-                    img_np = (
-                        frame.asnumpy()
-                        if hasattr(frame, "asnumpy")
-                        else np.array(frame)
-                    )
+                for img_np in frames_np:
                     frame_t = (
-                        torch.from_numpy(img_np).permute(2, 0, 1).cuda().float() / 255.0
+                        torch.from_numpy(img_np).permute(2, 0, 1).cuda().float()
+                        / 255.0
                     )
                     frame_t = (frame_t - mean) / std
-
                     tiles = self.dynamic_preprocess(
                         frame_t,
                         image_size=448,
