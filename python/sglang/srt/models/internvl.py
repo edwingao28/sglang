@@ -1,3 +1,4 @@
+import os
 from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -46,6 +47,10 @@ from sglang.srt.utils import is_cuda
 from sglang.utils import logger
 
 _is_cuda = is_cuda()
+
+# Profile ViT/Projector/LLM breakdown. Enable with SGLANG_INTERNVL_PROFILE=1
+_INTERNVL_PROFILE = os.environ.get("SGLANG_INTERNVL_PROFILE", "0") == "1"
+_INTERNVL_PROFILE_MAX_LOGS = int(os.environ.get("SGLANG_INTERNVL_PROFILE_LOGS", "20"))
 
 
 class InternAttention(nn.Module):
@@ -568,6 +573,15 @@ class InternVLChatModel(nn.Module):
 
         self.model = self.language_model.model
 
+        # Profiling state (only used when SGLANG_INTERNVL_PROFILE=1)
+        if _INTERNVL_PROFILE:
+            self._prof_logs_remaining = _INTERNVL_PROFILE_MAX_LOGS
+            self._prof_events = []
+            logger.info(
+                f"[InternVL Profile] Profiling enabled. "
+                f"Will log first {_INTERNVL_PROFILE_MAX_LOGS} vision forward calls."
+            )
+
     def pixel_shuffle(self, x, scale_factor=0.5):
         n, w, h, c = x.size()
         # N, W, H, C --> N, W, H * scale, C // scale
@@ -591,6 +605,14 @@ class InternVLChatModel(nn.Module):
         return x
 
     def extract_feature(self, pixel_values):
+        _profiling = _INTERNVL_PROFILE and self._prof_logs_remaining > 0
+        if _profiling:
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_after_vit = torch.cuda.Event(enable_timing=True)
+            ev_after_shuffle = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            ev_start.record()
+
         if self.select_layer == -1:
             vit_embeds = self.vision_model(
                 pixel_values=pixel_values, output_hidden_states=False, return_dict=True
@@ -601,11 +623,25 @@ class InternVLChatModel(nn.Module):
             ).hidden_states[self.select_layer]
         vit_embeds = vit_embeds[:, 1:, :]
 
+        if _profiling:
+            ev_after_vit.record()
+
         h = w = int(vit_embeds.shape[1] ** 0.5)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
         vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
         vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
+
+        if _profiling:
+            ev_after_shuffle.record()
+
         vit_embeds = self.mlp1(vit_embeds)
+
+        if _profiling:
+            ev_end.record()
+            self._prof_events.append(
+                (pixel_values.shape[0], ev_start, ev_after_vit, ev_after_shuffle, ev_end)
+            )
+
         return vit_embeds
 
     def get_image_feature(self, items: List[MultimodalDataItem]):
@@ -634,6 +670,12 @@ class InternVLChatModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+        _profiling = _INTERNVL_PROFILE and self._prof_logs_remaining > 0
+        if _profiling:
+            self._prof_events = []
+            ev_fwd_start = torch.cuda.Event(enable_timing=True)
+            ev_fwd_end = torch.cuda.Event(enable_timing=True)
+            ev_fwd_start.record()
 
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
@@ -643,6 +685,34 @@ class InternVLChatModel(nn.Module):
             data_embedding_funcs=self.external_mm_data_embedding_funcs,
             positions=positions,
         )
+
+        if _profiling and self._prof_events:
+            ev_fwd_end.record()
+            torch.cuda.synchronize()
+            total_ms = ev_fwd_start.elapsed_time(ev_fwd_end)
+            vision_total_ms = 0.0
+            for n_tiles, ev_s, ev_v, ev_sh, ev_e in self._prof_events:
+                vit_ms = ev_s.elapsed_time(ev_v)
+                shuffle_ms = ev_v.elapsed_time(ev_sh)
+                mlp1_ms = ev_sh.elapsed_time(ev_e)
+                sub_total = vit_ms + shuffle_ms + mlp1_ms
+                vision_total_ms += sub_total
+                logger.info(
+                    f"[InternVL Profile] extract_feature: tiles={n_tiles} | "
+                    f"ViT={vit_ms:.1f}ms  Shuffle={shuffle_ms:.1f}ms  "
+                    f"MLP1={mlp1_ms:.1f}ms  Subtotal={sub_total:.1f}ms"
+                )
+            llm_ms = total_ms - vision_total_ms
+            logger.info(
+                f"[InternVL Profile] forward: Total={total_ms:.1f}ms | "
+                f"Vision={vision_total_ms:.1f}ms ({vision_total_ms / total_ms * 100:.1f}%) | "
+                f"LLM+Embed={llm_ms:.1f}ms ({llm_ms / total_ms * 100:.1f}%)"
+            )
+            self._prof_logs_remaining -= 1
+            if self._prof_logs_remaining == 0:
+                logger.info(
+                    "[InternVL Profile] Max logs reached. Profiling disabled."
+                )
 
         return hidden_states
 
