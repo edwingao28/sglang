@@ -2846,7 +2846,7 @@ class Scheduler(
         pending_req, deadline = self._pending_flush
 
         if self.is_fully_idle():
-            success = self.flush_cache()
+            success = self.flush_cache(empty_cache=pending_req.empty_cache)
             self._pending_flush = None
             self.send_to_tokenizer.send_output(
                 FlushCacheReqOutput(success=success), pending_req
@@ -2876,10 +2876,14 @@ class Scheduler(
 
         timeout_s = float(recv_req.timeout_s or 0.0)
         if timeout_s <= 0.0:
-            return FlushCacheReqOutput(success=self.flush_cache())
+            return FlushCacheReqOutput(
+                success=self.flush_cache(empty_cache=recv_req.empty_cache)
+            )
 
         if self.is_fully_idle():
-            return FlushCacheReqOutput(success=self.flush_cache())
+            return FlushCacheReqOutput(
+                success=self.flush_cache(empty_cache=recv_req.empty_cache)
+            )
 
         self._pending_flush = (recv_req, time.monotonic() + timeout_s)
         return None
@@ -3035,7 +3039,7 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self):
+    def flush_cache(self, empty_cache: bool = True):
         """Flush the memory pool and cache."""
         if self.is_fully_idle():
             self.cur_batch = None
@@ -3049,8 +3053,8 @@ class Scheduler(
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
 
-            # TODO: allow optional empty cache
-            torch.cuda.empty_cache()
+            if empty_cache:
+                torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
             success = True
         else:
