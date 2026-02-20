@@ -788,6 +788,15 @@ def _set_envs_and_config(server_args: ServerArgs):
         f"sglang-run-{time.time()}-{random.randint(0, 100000000)}"
     )
 
+    # Forward InternVL profiling env vars through server args because scheduler
+    # workers are started with multiprocessing "spawn" and may not inherit shell envs.
+    if server_args.mm_process_config is None:
+        server_args.mm_process_config = {}
+    for key in ("SGLANG_INTERNVL_PROFILE", "SGLANG_INTERNVL_PROFILE_LOGS"):
+        val = os.environ.get(key)
+        if val is not None:
+            server_args.mm_process_config[key] = val
+
     # Set prometheus env vars
     if server_args.enable_metrics:
         set_prometheus_multiproc_dir()

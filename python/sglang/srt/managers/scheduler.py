@@ -2767,6 +2767,14 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    # Restore InternVL profiling env vars forwarded from the launcher process.
+    # This is needed for "spawn" workers where shell env vars may not propagate.
+    mm_cfg = server_args.mm_process_config or {}
+    for key in ("SGLANG_INTERNVL_PROFILE", "SGLANG_INTERNVL_PROFILE_LOGS"):
+        val = mm_cfg.get(key)
+        if val is not None:
+            os.environ[key] = str(val)
+
     # Generate the logger prefix
     prefix = ""
     if dp_rank is None and "SGLANG_DP_RANK" in os.environ:

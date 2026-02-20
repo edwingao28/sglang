@@ -1,5 +1,5 @@
 import os
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -48,9 +48,48 @@ from sglang.utils import logger
 
 _is_cuda = is_cuda()
 
-# Profile ViT/Projector/LLM breakdown. Enable with SGLANG_INTERNVL_PROFILE=1
-_INTERNVL_PROFILE = os.environ.get("SGLANG_INTERNVL_PROFILE", "0") == "1"
-_INTERNVL_PROFILE_MAX_LOGS = int(os.environ.get("SGLANG_INTERNVL_PROFILE_LOGS", "20"))
+
+def _safe_parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    val = str(value).strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _safe_parse_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_internvl_profile_config() -> Tuple[bool, int]:
+    # Prefer scheduler-internal config (serialized with server args), then fall
+    # back to process environment.
+    cfg = {}
+    try:
+        cfg = get_global_server_args().mm_process_config or {}
+    except Exception:
+        cfg = {}
+
+    enabled = _safe_parse_bool(
+        cfg.get("SGLANG_INTERNVL_PROFILE", os.environ.get("SGLANG_INTERNVL_PROFILE")),
+        default=False,
+    )
+    max_logs = _safe_parse_int(
+        cfg.get(
+            "SGLANG_INTERNVL_PROFILE_LOGS",
+            os.environ.get("SGLANG_INTERNVL_PROFILE_LOGS", "20"),
+        ),
+        20,
+    )
+    return enabled, max(0, max_logs)
 
 
 class InternAttention(nn.Module):
@@ -573,13 +612,17 @@ class InternVLChatModel(nn.Module):
 
         self.model = self.language_model.model
 
+        self._internvl_profile_enabled, self._internvl_profile_max_logs = (
+            _get_internvl_profile_config()
+        )
+
         # Profiling state (only used when SGLANG_INTERNVL_PROFILE=1)
-        if _INTERNVL_PROFILE:
-            self._prof_logs_remaining = _INTERNVL_PROFILE_MAX_LOGS
+        if self._internvl_profile_enabled:
+            self._prof_logs_remaining = self._internvl_profile_max_logs
             self._prof_events = []
             logger.info(
                 f"[InternVL Profile] Profiling enabled. "
-                f"Will log first {_INTERNVL_PROFILE_MAX_LOGS} vision forward calls."
+                f"Will log first {self._internvl_profile_max_logs} vision forward calls."
             )
 
     def pixel_shuffle(self, x, scale_factor=0.5):
@@ -605,7 +648,7 @@ class InternVLChatModel(nn.Module):
         return x
 
     def extract_feature(self, pixel_values):
-        _profiling = _INTERNVL_PROFILE and self._prof_logs_remaining > 0
+        _profiling = self._internvl_profile_enabled and self._prof_logs_remaining > 0
         if _profiling:
             ev_start = torch.cuda.Event(enable_timing=True)
             ev_after_vit = torch.cuda.Event(enable_timing=True)
@@ -670,7 +713,7 @@ class InternVLChatModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        _profiling = _INTERNVL_PROFILE and self._prof_logs_remaining > 0
+        _profiling = self._internvl_profile_enabled and self._prof_logs_remaining > 0
         if _profiling:
             self._prof_events = []
             ev_fwd_start = torch.cuda.Event(enable_timing=True)
