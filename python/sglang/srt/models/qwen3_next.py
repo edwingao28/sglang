@@ -444,6 +444,17 @@ class Qwen3GatedDeltaNet(nn.Module):
             hidden_states
         )
 
+        # [DEBUG] Step 5: log forward projection output (first call only)
+        if self.layer_id == 0 and not getattr(self, '_debug_fwd_logged', False):
+            self._debug_fwd_logged = True
+            print(
+                f"[fwd] rank={self.attn_tp_rank} "
+                f"qkvz_shape={tuple(projected_states_qkvz.shape)} "
+                f"qkvz_norm={projected_states_qkvz.norm().item():.4f} "
+                f"ba_shape={tuple(projected_states_ba.shape)} "
+                f"ba_norm={projected_states_ba.norm().item():.4f}"
+            )
+
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat(
                 projected_states_qkvz,
@@ -1075,6 +1086,10 @@ class Qwen3NextForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
         for name, loaded_weight in weights:
 
+            # [DEBUG] Step 0: print checkpoint keys for GDN layer 0
+            if "layers.0" in name and "in_proj" in name:
+                print(f"[ckpt key] {name} shape={tuple(loaded_weight.shape)}")
+
             if is_mtp:
 
                 if "mtp" not in name:
@@ -1115,6 +1130,15 @@ class Qwen3NextForCausalLM(nn.Module):
                     continue
 
                 replaced_name = name.replace(weight_name, param_name)
+
+                # [DEBUG] Step 2: log mapping attempts for layer 0 GDN
+                if "layers.0" in name and "in_proj" in name:
+                    print(
+                        f"[mapping] name={name} weight_name={weight_name} "
+                        f"param_name={param_name} replaced={replaced_name} "
+                        f"shard_id={shard_id} in_params={replaced_name in params_dict}"
+                    )
+
                 # Skip loading extra bias for GPTQ models.
                 if replaced_name.endswith(".bias") and replaced_name not in params_dict:
                     continue
@@ -1129,6 +1153,10 @@ class Qwen3NextForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # [DEBUG] log fallthrough for layer 0 GDN
+                if "layers.0" in name and "in_proj" in name:
+                    print(f"[fallthrough] {name} -> no mapping matched, default loader")
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:

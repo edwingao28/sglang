@@ -532,6 +532,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ):
+        # [DEBUG] Step 3: log weight_loader entry for GDN layers
+        if hasattr(self, 'prefix') and "layers.0.linear_attn" in self.prefix and "in_proj" in self.prefix:
+            print(
+                f"[loader] prefix={self.prefix} tp_rank={self.tp_rank} tp_size={self.tp_size} "
+                f"loaded_shard_id={loaded_shard_id} type={type(loaded_shard_id).__name__} "
+                f"loaded_weight_shape={tuple(loaded_weight.shape)} "
+                f"param_shape={tuple(param.data.shape)} "
+                f"output_sizes={self.output_sizes}"
+            )
+
         if isinstance(loaded_shard_id, tuple):
             if hasattr(param, "load_merged_column_weight"):
                 return self.weight_loader_v2(param, loaded_weight, loaded_shard_id)
@@ -723,6 +733,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         current_shard_offset = 0
         shard_offsets: List[Tuple[int, int, int]] = []
         output_sizes = output_sizes or self.output_sizes
+
+        # [DEBUG] log fused checkpoint split for GDN
+        if hasattr(self, 'prefix') and "layers.0.linear_attn" in self.prefix and "in_proj" in self.prefix:
+            print(
+                f"[fused_split] prefix={self.prefix} "
+                f"output_sizes={output_sizes} total={sum(output_sizes)} "
+                f"loaded_weight_shape={tuple(loaded_weight.shape)}"
+            )
+
         for i, output_size in enumerate(output_sizes):
             shard_offsets.append((i, current_shard_offset, output_size))
             current_shard_offset += output_size
