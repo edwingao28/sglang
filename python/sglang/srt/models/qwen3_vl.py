@@ -392,6 +392,10 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         )
         self.cuda_graph_runner: Optional[ViTCudaGraphRunner] = ViTCudaGraphRunner(self)
 
+        # Profiling (gated by SGLANG_QWEN3VL_PROFILE=1)
+        self._profile_enabled = envs.SGLANG_QWEN3VL_PROFILE.get()
+        self._prof_events = []
+
     @property
     def dtype(self) -> torch.dtype:
         return self.patch_embed.proj.weight.dtype
@@ -723,6 +727,14 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             return self.forward_with_cuda_graph(x, grid_thw)
 
+        _profiling = self._profile_enabled
+        if _profiling:
+            ev_start = torch.cuda.Event(enable_timing=True)
+            ev_after_embed = torch.cuda.Event(enable_timing=True)
+            ev_after_vit = torch.cuda.Event(enable_timing=True)
+            ev_end = torch.cuda.Event(enable_timing=True)
+            ev_start.record()
+
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
 
@@ -737,6 +749,9 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         x += pos_embeds
 
         rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+
+        if _profiling:
+            ev_after_embed.record()
 
         # ---- build token indptr (B+1,) ----
         token_cu_seqlens = np.repeat(
@@ -817,10 +832,21 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 )
                 deepstack_feature_lists.append(deepstack_feature)
                 num_deepstack_captured += 1
+
+        if _profiling:
+            ev_after_vit.record()
+
         x = self.merger(x)
         hidden_states = torch.cat(
             [x] + deepstack_feature_lists, dim=1
         )  # [seq_len, hidden_size * (1 + depth_of_deepstack)]
+
+        if _profiling:
+            ev_end.record()
+            self._prof_events.append(
+                (ev_start, ev_after_embed, ev_after_vit, ev_end)
+            )
+
         return hidden_states
 
     def forward_with_cuda_graph(
@@ -1081,6 +1107,17 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.num_deepstack_embeddings = len(self.deepstack_visual_indexes)
         self.use_deepstack = {Modality.IMAGE: True, Modality.VIDEO: True}
 
+        # Profiling
+        self._profile_enabled = envs.SGLANG_QWEN3VL_PROFILE.get()
+        self._prof_logs_remaining = (
+            envs.SGLANG_QWEN3VL_PROFILE_LOGS.get() if self._profile_enabled else 0
+        )
+        if self._profile_enabled:
+            logger.info(
+                f"[Qwen3VL Profile] Enabled, will log first "
+                f"{self._prof_logs_remaining} vision forward calls."
+            )
+
     def separate_deepstack_embeds(self, embedding):
         assert (
             embedding.shape[-1] % (1 + self.num_deepstack_embeddings) == 0
@@ -1267,6 +1304,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     f"(3, seq_len) positions, but got {positions.size()}"
                 )
 
+        _profiling = self._profile_enabled and self._prof_logs_remaining > 0
+        if _profiling:
+            self.visual._prof_events = []
+            ev_fwd_start = torch.cuda.Event(enable_timing=True)
+            ev_fwd_end = torch.cuda.Event(enable_timing=True)
+            ev_fwd_start.record()
+
         hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -1276,6 +1320,38 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             use_deepstack=self.use_deepstack,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+
+        if _profiling and self.visual._prof_events:
+            ev_fwd_end.record()
+            torch.cuda.synchronize()
+            total_ms = ev_fwd_start.elapsed_time(ev_fwd_end)
+            vision_total_ms = 0.0
+            for ev_s, ev_emb, ev_vit, ev_e in self.visual._prof_events:
+                embed_ms = ev_s.elapsed_time(ev_emb)
+                vit_ms = ev_emb.elapsed_time(ev_vit)
+                merger_ms = ev_vit.elapsed_time(ev_e)
+                sub_total = embed_ms + vit_ms + merger_ms
+                vision_total_ms += sub_total
+                logger.info(
+                    f"[Qwen3VL Profile] vision: "
+                    f"PatchEmbed+PosEmbed={embed_ms:.1f}ms  "
+                    f"ViTBlocks={vit_ms:.1f}ms  "
+                    f"Mergers={merger_ms:.1f}ms  "
+                    f"Subtotal={sub_total:.1f}ms"
+                )
+            llm_ms = total_ms - vision_total_ms
+            logger.info(
+                f"[Qwen3VL Profile] forward: Total={total_ms:.1f}ms | "
+                f"Vision={vision_total_ms:.1f}ms "
+                f"({vision_total_ms / total_ms * 100:.1f}%) | "
+                f"LLM+Embed={llm_ms:.1f}ms "
+                f"({llm_ms / total_ms * 100:.1f}%)"
+            )
+            self._prof_logs_remaining -= 1
+            if self._prof_logs_remaining == 0:
+                logger.info(
+                    "[Qwen3VL Profile] Max logs reached. Profiling disabled."
+                )
 
         if self.pp_group.is_last_rank:
             if not get_embedding:
