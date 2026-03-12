@@ -77,6 +77,8 @@ class VLMInputTestBase:
             enable_multimodal=True,
             disable_cuda_graph=True,
             trust_remote_code=True,
+            enforce_piecewise_cuda_graph=True,
+            
         )
 
     def tearDown(self):

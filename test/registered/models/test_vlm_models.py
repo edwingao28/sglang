@@ -32,6 +32,8 @@ else:
 
 
 class TestVLMModels(MMMUMultiModelTestBase):
+    other_args = ["--enforce-piecewise-cuda-graph"]
+
     def test_vlm_mmmu_benchmark(self):
         """Test VLM models against MMMU benchmark."""
         models_to_test = MODELS
