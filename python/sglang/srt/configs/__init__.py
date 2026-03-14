@@ -1,4 +1,5 @@
 from sglang.srt.configs.afmoe import AfmoeConfig
+from sglang.srt.configs.eagle2_5_vl import Eagle2_5_VLConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.dbrx import DbrxConfig
@@ -32,6 +33,7 @@ from sglang.srt.configs.step3p5 import Step3p5Config
 
 __all__ = [
     "AfmoeConfig",
+    "Eagle2_5_VLConfig",
     "BailingHybridConfig",
     "ExaoneConfig",
     "ChatGLMConfig",

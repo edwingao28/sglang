@@ -334,6 +334,9 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
                     name.replace(".attention.qkv_proj.", ".self_attn.qkv_proj."),
                     name.replace(".attention.proj.", ".self_attn.proj."),
                     name.replace("attn.qkv.", "attn.qkv_proj."),
+                    name.replace(
+                        ".self_attn.out_proj.", ".self_attn.proj."
+                    ),  # SigLIP naming
                 ]
                 picked = _pick_existing(cands)
                 if picked is None:

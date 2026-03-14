@@ -45,6 +45,7 @@ from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_N
 
 from sglang.srt.configs import (
     AfmoeConfig,
+    Eagle2_5_VLConfig,
     BailingHybridConfig,
     ChatGLMConfig,
     DbrxConfig,
@@ -79,6 +80,7 @@ from sglang.srt.utils.patch_tokenizer import patch_tokenizer
 
 _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     AfmoeConfig,
+    Eagle2_5_VLConfig,
     BailingHybridConfig,
     ChatGLMConfig,
     DbrxConfig,

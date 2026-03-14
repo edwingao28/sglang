@@ -70,21 +70,21 @@ class Eagle2_5_VLConfig(PretrainedConfig):
         if vision_config is None:
             vision_config = {"model_type": "siglip_vision_model"}
             logger.info(
-                "vision_config is None. Initializing the InternVisionConfig with default values."
+                "vision_config is None. Initializing the SiglipVisionConfig with default values."
             )
 
         if llm_config is not None:
             text_config = llm_config
-            logger.info("llm_config:", llm_config)
-            logger.info("text_config:", text_config)
+            logger.info(f"llm_config: {llm_config}")
+            logger.info(f"text_config: {text_config}")
             logger.warning(
-                "`llm_config` is None. We set the `llm_config` to `text_config`."
+                "`llm_config` is not None. Setting `text_config` from `llm_config`."
             )
 
         if text_config is None:
             text_config = {"architectures": ["Qwen2ForCausalLM"]}
             logger.info(
-                "text_config is None. Initializing the LlamaConfig config with default values (`LlamaConfig`)."
+                "text_config is None. Initializing the Qwen2Config with default values."
             )
 
         if vision_config["model_type"] == "siglip_vision_model":
