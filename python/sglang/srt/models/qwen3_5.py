@@ -1141,9 +1141,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
             if (
-                self.pp_group.is_last_rank
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
                 and "model.embed_tokens.weight" in name
-                and self.config.tie_word_embeddings
             ):
                 if "lm_head.weight" in params_dict:
                     lm_head_param = params_dict["lm_head.weight"]
@@ -1300,6 +1300,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if (
+                self.config.tie_word_embeddings
+                and self.pp_group.is_last_rank
+                and "model.embed_tokens.weight" in name
+            ):
+                if "lm_head.weight" in params_dict:
+                    lm_head_param = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        lm_head_param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(lm_head_param, loaded_weight)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if name.endswith("experts.gate_up_proj") or name.endswith(
