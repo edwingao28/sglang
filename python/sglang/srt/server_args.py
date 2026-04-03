@@ -1106,32 +1106,29 @@ class ServerArgs:
         # 8. LoRA
         if self.lora_paths or self.enable_lora:
             self.disable_piecewise_cuda_graph = True
-        # 9. Multimodal / VLM models
-        if self.get_model_config().is_multimodal:
-            self.disable_piecewise_cuda_graph = True
-        # 10. GGUF quantized models (custom dequant ops unsupported by torch.compile)
+        # 9. GGUF quantized models (custom dequant ops unsupported by torch.compile)
         if (
             self.load_format == "gguf"
             or self.quantization == "gguf"
             or check_gguf_file(self.model_path)
         ):
             self.disable_piecewise_cuda_graph = True
-        # 11. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
+        # 10. DLLM (diffusion LLM) models (context manager in forward breaks dynamo)
         if self.dllm_algorithm is not None:
             self.disable_piecewise_cuda_graph = True
-        # 12. CPU offload (breaks dynamo)
+        # 11. CPU offload (breaks dynamo)
         if self.cpu_offload_gb > 0 or self.enable_hierarchical_cache:
             self.disable_piecewise_cuda_graph = True
-        # 13. Deterministic inference
+        # 12. Deterministic inference
         if self.enable_deterministic_inference:
             self.disable_piecewise_cuda_graph = True
-        # 14. PD disaggregation
+        # 13. PD disaggregation
         if self.disaggregation_mode != "null":
             self.disable_piecewise_cuda_graph = True
-        # 15. Symmetric memory (torch.cuda.use_mem_pool is untraceable by dynamo)
+        # 14. Symmetric memory (torch.cuda.use_mem_pool is untraceable by dynamo)
         if self.enable_symm_mem:
             self.disable_piecewise_cuda_graph = True
-        # 16. Expert distribution recorder
+        # 15. Expert distribution recorder
         if self.enable_eplb or self.expert_distribution_recorder_mode is not None:
             self.disable_piecewise_cuda_graph = True
 
