@@ -746,20 +746,7 @@ class ServerArgs:
         self._handle_load_balance_method()
 
         # Validate mm_process_config before dummy-model early return.
-        if self.mm_process_config is not None:
-            if not isinstance(self.mm_process_config, dict):
-                raise TypeError(
-                    f"mm_process_config must be a dict, "
-                    f"but got {type(self.mm_process_config)}"
-                )
-            for key in ("image", "video", "audio"):
-                if key in self.mm_process_config and not isinstance(
-                    self.mm_process_config[key], dict
-                ):
-                    raise TypeError(
-                        f"mm_process_config['{key}'] must be a dict, "
-                        f"but got {type(self.mm_process_config[key])}"
-                    )
+        self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
 
@@ -915,6 +902,23 @@ class ServerArgs:
                 "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
                 "to be specified."
             )
+
+    def _handle_multimodal(self):
+        """Validate mm_process_config structure before model loading."""
+        if self.mm_process_config is not None:
+            if not isinstance(self.mm_process_config, dict):
+                raise TypeError(
+                    f"mm_process_config must be a dict, "
+                    f"but got {type(self.mm_process_config)}"
+                )
+            for key in ("image", "video", "audio"):
+                if key in self.mm_process_config and not isinstance(
+                    self.mm_process_config[key], dict
+                ):
+                    raise TypeError(
+                        f"mm_process_config['{key}'] must be a dict, "
+                        f"but got {type(self.mm_process_config[key])}"
+                    )
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
