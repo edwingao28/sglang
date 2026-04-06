@@ -35,14 +35,14 @@
 # --------------------------------------------------------
 
 import copy
-from typing import Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
+    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import (
@@ -62,35 +62,33 @@ from sglang.utils import logger
 
 try:
     from sglang.srt.layers.attention import vision_utils
-except Exception:
+except ImportError:
     vision_utils = None
 
-from sglang.srt.configs.eagle2_5_vl import Eagle2_5_VLConfig
-from sglang.srt.models.siglip import SiglipVisionModel  # type: ignore
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
 
 class Eagle2_5_VLForConditionalGeneration(nn.Module):
     def __init__(
         self,
-        config: Eagle2_5_VLConfig,
+        config,
         quant_config: Optional[QuantizationConfig] = None,
         use_flash_attn: bool = True,
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        # TODO: Wire use_data_parallel to SigLIP encoder layers.
+        # InternVL passes this through InternVisionModel → InternVisionEncoder →
+        # InternVisionEncoderLayer → InternAttention/InternMLP. SigLIP's
+        # VisionAttention needs similar plumbing to enable DP encoder sharding.
         self.use_data_parallel = get_global_server_args().mm_enable_dp_encoder
 
-        # Unify config naming (Eagle config often uses text_config; InternVL uses llm_config)
         if not hasattr(config, "llm_config") and hasattr(config, "text_config"):
             config.llm_config = config.text_config  # type: ignore[attr-defined]
 
         if vision_utils is not None:
-            # harmless if config doesn't need dummy heads
-            try:
-                vision_utils.update_vit_attn_dummy_heads_config(self.config)
-            except Exception:
-                pass
+            vision_utils.update_vit_attn_dummy_heads_config(self.config)
 
         image_size = (
             getattr(config, "force_image_size", None) or config.vision_config.image_size
@@ -103,8 +101,6 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             (image_size // patch_size) ** 2 * (self.downsample_ratio**2)
         )
 
-        # Eagle uses select_layer to decide how many vision layers to keep.
-        # We'll truncate the vision stack so we can always read last_hidden_state.
         self.select_layer = getattr(config, "select_layer", -1)
         self._init_vision_model()
 
@@ -219,8 +215,20 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         vit_embeds = self.mlp1(vit_embeds)
         L = int(self.num_image_token)
         if vit_embeds.size(1) > L:
+            logger.warning(
+                "[Eagle2.5-VL] extract_feature: truncating %d -> %d tokens. "
+                "This may indicate a num_image_token formula mismatch.",
+                vit_embeds.size(1),
+                L,
+            )
             vit_embeds = vit_embeds[:, :L, :]
         elif vit_embeds.size(1) < L:
+            logger.warning(
+                "[Eagle2.5-VL] extract_feature: padding %d -> %d tokens with zeros. "
+                "This may indicate a num_image_token formula mismatch.",
+                vit_embeds.size(1),
+                L,
+            )
             vit_embeds = torch.cat(
                 [
                     vit_embeds,
@@ -239,6 +247,9 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         Return: [num_images_or_tiles, img_len, hidden]
         """
         pixel_values = torch.cat([item.feature for item in items], dim=0)
+        # Precomputed embeddings are 2D or 3D; raw pixel_values are 4D [N, C, H, W]
+        if pixel_values.dim() != 4:
+            return pixel_values
         return self.extract_feature(pixel_values)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
@@ -248,6 +259,9 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         Return: [num_frames_total, img_len, hidden]
         """
         pixel_values = torch.cat([item.feature for item in items], dim=0)
+        # Precomputed embeddings are 2D or 3D; raw pixel_values are 4D [N, C, H, W]
+        if pixel_values.dim() != 4:
+            return pixel_values
         return self.extract_feature(pixel_values)
 
     @torch.no_grad()
@@ -269,23 +283,41 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
         return hidden_states
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
+        media_token_pairs = [(mm_inputs.im_start_id, mm_inputs.im_end_id)]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-            ("gate_up_proj", "gate_proj", 0),
-            ("gate_up_proj", "up_proj", 1),
-        ]
+        arch = self.config.llm_config.architectures[0]
+
+        # Dispatch stacked_params_mapping per LLM architecture
+        expert_params_mapping = []
+        if arch == "InternLM2ForCausalLM":
+            stacked_params_mapping = [
+                ("gate_up_proj", "w1", 0),
+                ("gate_up_proj", "w3", 1),
+            ]
+        else:
+            # Qwen2ForCausalLM, Qwen3ForCausalLM, Qwen3MoeForCausalLM
+            stacked_params_mapping = [
+                ("qkv_proj", "q_proj", "q"),
+                ("qkv_proj", "k_proj", "k"),
+                ("qkv_proj", "v_proj", "v"),
+                ("gate_up_proj", "gate_proj", 0),
+                ("gate_up_proj", "up_proj", 1),
+            ]
+            if arch == "Qwen3MoeForCausalLM":
+                expert_params_mapping = FusedMoE.make_expert_params_mapping(
+                    ckpt_gate_proj_name="gate_proj",
+                    ckpt_down_proj_name="down_proj",
+                    ckpt_up_proj_name="up_proj",
+                    num_experts=self.config.llm_config.num_experts,
+                )
 
         params_dict = dict(self.named_parameters())
         has_vision_head = any(
             k.startswith("vision_model.") and ".head." in k for k in params_dict
         )
-        loaded_params: Set[str] = set()
 
         def _pick_existing(cands: List[str]) -> Optional[str]:
             for c in cands:
@@ -297,59 +329,102 @@ class Eagle2_5_VLForConditionalGeneration(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
-            merged = False
+            # Stacked params (skip MoE experts — handled separately below)
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                merged_name = name.replace(weight_name, param_name)
-                if merged_name.endswith(".bias") and merged_name not in params_dict:
-                    merged = True
-                    break
-                if merged_name in params_dict:
-                    param = params_dict[merged_name]
-                    param.weight_loader(param, loaded_weight, shard_id)
-                    loaded_params.add(merged_name)
-                    merged = True
-                    break
-            if merged:
-                continue
-
-            if (
-                name.startswith("vision_model.")
-                and (".head." in name)
-                and (not has_vision_head)
-            ):
-                continue
-
-            if name.startswith("vision_model."):
-                cands = [
-                    name,
-                    name.replace(".attention.", ".self_attn."),
-                    name.replace(".attn.", ".self_attn."),
-                    name.replace(
-                        ".attention.in_proj_weight", ".self_attn.qkv_proj.weight"
-                    ),
-                    name.replace(".attention.in_proj_bias", ".self_attn.qkv_proj.bias"),
-                    name.replace(".attention.out_proj.", ".self_attn.proj."),
-                    name.replace(".attention.qkv_proj.", ".self_attn.qkv_proj."),
-                    name.replace(".attention.proj.", ".self_attn.proj."),
-                    name.replace("attn.qkv.", "attn.qkv_proj."),
-                ]
-                picked = _pick_existing(cands)
-                if picked is None:
+                if "mlp.experts" in name:
                     continue
-                name = picked
+                name = name.replace(weight_name, param_name)
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                if name.startswith("vision_model."):
+                    if ".head." in name and not has_vision_head:
+                        continue
+                    cands = [
+                        name,
+                        name.replace(".attention.", ".self_attn."),
+                        name.replace(".attn.", ".self_attn."),
+                        name.replace(
+                            ".attention.in_proj_weight",
+                            ".self_attn.qkv_proj.weight",
+                        ),
+                        name.replace(
+                            ".attention.in_proj_bias", ".self_attn.qkv_proj.bias"
+                        ),
+                        name.replace(".attention.out_proj.", ".self_attn.proj."),
+                        name.replace(".attention.qkv_proj.", ".self_attn.qkv_proj."),
+                        name.replace(".attention.proj.", ".self_attn.proj."),
+                        name.replace("attn.qkv.", "attn.qkv_proj."),
+                        name.replace(".self_attn.out_proj.", ".self_attn.proj."),
+                    ]
+                    picked = _pick_existing(cands)
+                    if picked is None:
+                        continue
+                    name = picked
 
-            if name.endswith(".bias") and name not in params_dict:
-                continue
+                # MoE expert params (Qwen3Moe)
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    break
+                else:
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
 
-            param = params_dict.get(name, None)
-            if param is None:
-                continue
+                    param = params_dict.get(name, None)
+                    if param is None:
+                        continue
 
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
+                    # InternLM2 fused QKV split
+                    if "wqkv" in name:
+                        config = self.config.llm_config
+                        kv_groups = (
+                            config.num_attention_heads // config.num_key_value_heads
+                        )
+                        head_dim = config.hidden_size // config.num_attention_heads
+                        loaded_weight = loaded_weight.view(
+                            -1,
+                            2 + kv_groups,
+                            head_dim,
+                            loaded_weight.shape[-1],
+                        )
+                        wq, wk, wv = torch.split(
+                            loaded_weight, [kv_groups, 1, 1], dim=1
+                        )
+                        wq = wq.reshape(-1, wq.shape[-1])
+                        wk = wk.reshape(-1, wk.shape[-1])
+                        wv = wv.reshape(-1, wv.shape[-1])
+                        weight_loader = param.weight_loader
+                        weight_loader(param, wq, "q")
+                        weight_loader(param, wk, "k")
+                        weight_loader(param, wv, "v")
+                    else:
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        if "vision_model" in name and vision_utils is not None:
+                            loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                                self.config, name, loaded_weight
+                            )
+                        weight_loader(param, loaded_weight)
 
 
 EntryClass = [Eagle2_5_VLForConditionalGeneration]

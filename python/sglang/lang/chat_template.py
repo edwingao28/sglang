@@ -530,10 +530,10 @@ register_chat_template(
         default_system_prompt="You are a helpful assistant.",
         role_prefix_and_suffix={
             "system": ("<|im_start|>system\n", "<|im_end|>\n"),
-            "user": ("<|user|>\n", "\n"),
-            "assistant": ("<|assistant|>\n", "\n"),
+            "user": ("<|im_start|>user\n", "<|im_end|>\n"),
+            "assistant": ("<|im_start|>assistant\n", "<|im_end|>\n"),
         },
-        stop_str=["<|im_end|>"],
+        stop_str=["<|im_end|>", "<|endoftext|>"],
         image_token="<|image|>",
     )
 )

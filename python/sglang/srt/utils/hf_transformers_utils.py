@@ -1189,6 +1189,20 @@ def get_processor(
                     **kwargs,
                 )
 
+    except ImportError:
+        # Some models (e.g. Eagle2.5-VL) lack a fast image processor.
+        logger.info(
+            f"Fast image processor for {tokenizer_name} failed to import. "
+            f"Falling back to slow version"
+        )
+        kwargs["use_fast"] = False
+        processor = AutoProcessor.from_pretrained(
+            tokenizer_name,
+            *args,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
     except ValueError as e:
         error_message = str(e)
         if "does not have a slow version" in error_message:

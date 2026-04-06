@@ -273,7 +273,8 @@ class SiglipVisionTransformer(nn.Module):
             return_all_hidden_states=return_all_hidden_states,
         )
 
-        last_hidden_state = self.post_layernorm(last_hidden_state)
+        if self.post_layernorm is not None:
+            last_hidden_state = self.post_layernorm(last_hidden_state)
 
         return last_hidden_state
 
