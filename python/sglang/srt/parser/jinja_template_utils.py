@@ -128,6 +128,7 @@ def process_content_for_template_format(
     audio_data: list,
     modalities: list,
     use_dpsk_v32_encoding: bool = False,
+    preserve_mm_string_placeholders: bool = False,
 ) -> dict:
     """
     Process message content based on detected template format.
@@ -140,6 +141,9 @@ def process_content_for_template_format(
         audio_data: List to append extracted audio URLs
         modalities: List to append modalities
         use_dpsk_v32_encoding: If True, extract multimodal data and convert content to string (for DeepSeek-V3.2 encoding)
+        preserve_mm_string_placeholders: If True, preserve multimodal chunks in
+            string-format templates by extracting their backing data and
+            inserting textual placeholders like <image-1>.
 
     Returns:
         Processed message dictionary
@@ -212,17 +216,53 @@ def process_content_for_template_format(
         return new_msg
 
     elif content_format == "string":
-        # String format: flatten to text only (for templates like DeepSeek)
-        text_parts = []
+        # Most string-format templates are truly text-only. Eagle2.5-VL is a
+        # special case: its HF Jinja template still expects a string, but the
+        # downstream multimodal processor requires recoverable placeholders.
+        content_parts = []
         for chunk in msg_dict["content"]:
-            if isinstance(chunk, dict) and chunk.get("type") == "text":
-                text_parts.append(chunk["text"])
-            # Note: For string format, we ignore images/audio since the template
-            # doesn't expect structured content - multimodal placeholders would
-            # need to be inserted differently
+            if not isinstance(chunk, dict):
+                continue
+
+            chunk_type = chunk.get("type")
+            if chunk_type == "text":
+                content_parts.append(chunk["text"])
+            elif preserve_mm_string_placeholders and chunk_type == "image_url":
+                image_obj = chunk.get("image_url") or {}
+                mdp = image_obj.get("max_dynamic_patch", None)
+                image_data.append(
+                    ImageData(
+                        url=image_obj["url"],
+                        detail=image_obj.get("detail", "auto"),
+                        max_dynamic_patch=mdp,
+                    )
+                )
+                if chunk.get("modalities"):
+                    modalities.append(chunk.get("modalities"))
+                content_parts.append(f"<image-{len(image_data)}>")
+            elif preserve_mm_string_placeholders and chunk_type == "video_url":
+                video_obj = chunk.get("video_url") or {}
+                mdp = video_obj.get("max_dynamic_patch", None)
+                if mdp is None:
+                    video_data.append(video_obj["url"])
+                else:
+                    video_data.append(
+                        {
+                            "url": video_obj["url"],
+                            "max_dynamic_patch": mdp,
+                        }
+                    )
+                if chunk.get("modalities"):
+                    modalities.append(chunk.get("modalities"))
+                content_parts.append(f"<video-{len(video_data)}>")
+            elif preserve_mm_string_placeholders and chunk_type == "audio_url":
+                audio_obj = chunk.get("audio_url") or {}
+                if "url" in audio_obj:
+                    audio_data.append(audio_obj["url"])
+                    content_parts.append(f"<audio-{len(audio_data)}>")
 
         new_msg = msg_dict.copy()
-        new_msg["content"] = " ".join(text_parts) if text_parts else ""
+        new_msg["content"] = " ".join(content_parts) if content_parts else ""
         new_msg = {k: v for k, v in new_msg.items() if v is not None}
         return new_msg
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 import uuid
 from http import HTTPStatus
@@ -388,6 +389,15 @@ class OpenAIServingChat(OpenAIServingBase):
         modalities = []
 
         template_content_format = self.template_manager.jinja_template_content_format
+        preserve_mm_string_placeholders = bool(
+            is_multimodal
+            and template_content_format == "string"
+            and re.search(
+                r"eagle2[._-]5",
+                self.tokenizer_manager.server_args.model_path,
+                re.IGNORECASE,
+            )
+        )
 
         if self.use_dpsk_v32_encoding:
             thinking_mode = (
@@ -409,6 +419,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     audio_data,
                     modalities,
                     use_dpsk_v32_encoding=self.use_dpsk_v32_encoding,
+                    preserve_mm_string_placeholders=preserve_mm_string_placeholders,
                 )
                 msg.update(processed_msg)
 
@@ -444,6 +455,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     video_data,
                     audio_data,
                     modalities,
+                    preserve_mm_string_placeholders=preserve_mm_string_placeholders,
                 )
 
                 # per the Transformers docs & maintainers, tool call arguments in

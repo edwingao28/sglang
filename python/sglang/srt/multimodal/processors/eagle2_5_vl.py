@@ -215,7 +215,7 @@ class Eagle2_5_VLProcessor(BaseMultimodalProcessor):
             image_token_id=self.img_context_token_id,
         ).build(_processor)
 
-        logger.info(
+        logger.debug(
             "[Eagle2.5-VL] processor init: num_image_token=%d, img_context_token_id=%d",
             self.num_image_token,
             self.img_context_token_id,

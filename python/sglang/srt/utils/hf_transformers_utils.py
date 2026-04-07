@@ -21,6 +21,7 @@ import tempfile
 import warnings
 from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Type, Union
 
 import torch
@@ -70,6 +71,7 @@ from sglang.srt.configs import (
     DeepseekVL2Config,
     DotsOCRConfig,
     DotsVLMConfig,
+    Eagle2_5_VLConfig,
     ExaoneConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
@@ -103,6 +105,7 @@ _CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
     DbrxConfig,
     ExaoneConfig,
     DeepseekVL2Config,
+    Eagle2_5_VLConfig,
     MultiModalityConfig,
     KimiVLConfig,
     InternVLChatConfig,
@@ -1116,6 +1119,48 @@ def _build_processor_manually(
     return proc_cls(**init_kwargs)
 
 
+def _should_build_local_eagle2_5_processor(config, exc: Exception) -> bool:
+    if getattr(config, "model_type", None) != "eagle_2_5_vl":
+        return False
+
+    message = str(exc)
+    return any(
+        marker in message
+        for marker in (
+            "DefaultFastImageProcessorKwargs",
+            "image_processing_eagle2_5_vl_fast",
+            "does not have a slow version",
+        )
+    )
+
+
+def _build_local_eagle2_5_processor(
+    model_path: str,
+    *,
+    tokenizer_mode: str,
+    trust_remote_code: bool,
+    revision: Optional[str],
+    use_fast: Optional[bool],
+    config,
+):
+    # Eagle2.5-VL uses SGLang's local multimodal processor path. The remote HF
+    # image processor only supplies config-like defaults, so a light shim is
+    # sufficient when the dynamic module is incompatible with local transformers.
+    tokenizer = get_tokenizer(
+        model_path,
+        tokenizer_mode=tokenizer_mode,
+        trust_remote_code=trust_remote_code,
+        tokenizer_revision=revision,
+        use_fast=use_fast,
+    )
+    image_processor = SimpleNamespace(
+        min_dynamic_tiles=getattr(config, "min_dynamic_tiles", 1),
+        max_dynamic_tiles=getattr(config, "max_dynamic_tiles", 6),
+        use_thumbnail=bool(getattr(config, "use_thumbnail", False)),
+    )
+    return SimpleNamespace(tokenizer=tokenizer, image_processor=image_processor)
+
+
 def get_processor(
     tokenizer_name: str,
     *args,
@@ -1189,34 +1234,54 @@ def get_processor(
                     **kwargs,
                 )
 
-    except ImportError:
-        # Some models (e.g. Eagle2.5-VL) lack a fast image processor.
-        logger.info(
-            f"Fast image processor for {tokenizer_name} failed to import. "
-            f"Falling back to slow version"
-        )
-        kwargs["use_fast"] = False
-        processor = AutoProcessor.from_pretrained(
-            tokenizer_name,
-            *args,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
     except ValueError as e:
         error_message = str(e)
-        if "does not have a slow version" in error_message:
+        if _should_build_local_eagle2_5_processor(config, e):
+            logger.warning(
+                "Falling back to local Eagle2.5-VL processor for %s due to "
+                "transformers/HF processor incompatibility: %s",
+                tokenizer_name,
+                error_message,
+            )
+            processor = _build_local_eagle2_5_processor(
+                tokenizer_name,
+                tokenizer_mode=tokenizer_mode,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                use_fast=use_fast,
+                config=config,
+            )
+        elif "does not have a slow version" in error_message:
             logger.info(
                 f"Processor {tokenizer_name} does not have a slow version. Automatically use fast version"
             )
             kwargs["use_fast"] = True
-            processor = AutoProcessor.from_pretrained(
-                tokenizer_name,
-                *args,
-                trust_remote_code=trust_remote_code,
-                revision=revision,
-                **kwargs,
-            )
+            try:
+                processor = AutoProcessor.from_pretrained(
+                    tokenizer_name,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    **kwargs,
+                )
+            except Exception as retry_error:
+                if _should_build_local_eagle2_5_processor(config, retry_error):
+                    logger.warning(
+                        "Falling back to local Eagle2.5-VL processor for %s after "
+                        "fast retry failed: %s",
+                        tokenizer_name,
+                        retry_error,
+                    )
+                    processor = _build_local_eagle2_5_processor(
+                        tokenizer_name,
+                        tokenizer_mode=tokenizer_mode,
+                        trust_remote_code=trust_remote_code,
+                        revision=revision,
+                        use_fast=True,
+                        config=config,
+                    )
+                else:
+                    raise
         elif "Unrecognized feature extractor" in error_message:
             logger.info(
                 "AutoProcessor failed on feature extractor for %s, "
@@ -1232,6 +1297,24 @@ def get_processor(
             )
         else:
             raise e
+    except ImportError as e:
+        if _should_build_local_eagle2_5_processor(config, e):
+            logger.warning(
+                "Falling back to local Eagle2.5-VL processor for %s due to "
+                "remote import failure: %s",
+                tokenizer_name,
+                e,
+            )
+            processor = _build_local_eagle2_5_processor(
+                tokenizer_name,
+                tokenizer_mode=tokenizer_mode,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                use_fast=use_fast,
+                config=config,
+            )
+        else:
+            raise
     # If processor is a bare tokenizer (e.g. Mistral-Small-4 has no processor_config.json)
     # and the model is a vision model (pixtral), wrap it in a proper PixtralProcessor
     # so that image data is actually processed through the image processor.
