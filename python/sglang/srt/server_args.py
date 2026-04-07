@@ -1260,6 +1260,12 @@ class ServerArgs:
                     self.piecewise_cuda_graph_max_tokens, self.max_total_tokens
                 )
 
+            # Cap by context_length to prevent OOB access during graph capture
+            if self.context_length is not None:
+                self.piecewise_cuda_graph_max_tokens = min(
+                    self.piecewise_cuda_graph_max_tokens, self.context_length
+                )
+
             # For Llama2 series models, the max tokens is limited to 4096
             # TODO(yuwei): remove this after the issue is fixed
             if "llama-2" in self.model_path.lower():
