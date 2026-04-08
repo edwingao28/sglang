@@ -928,6 +928,28 @@ class ServerArgs:
                 "to be specified."
             )
 
+        if self.enable_http2:
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
+
+            if self.enable_ssl_refresh:
+                raise ValueError(
+                    "--enable-ssl-refresh is not supported with --enable-http2. "
+                    "Granian does not support SSL certificate hot-reloading. "
+                    "Use Uvicorn (the default) or handle certificate rotation externally."
+                )
+
+            if self.tokenizer_worker_num > 1:
+                raise ValueError(
+                    "--enable-http2 does not yet support --tokenizer-worker-num > 1. "
+                    "Multi-worker HTTP/2 support will be added in a future release."
+                )
+
     def _handle_multimodal(self):
         """Validate mm_process_config structure before model loading."""
         if self.mm_process_config is not None:
@@ -944,28 +966,6 @@ class ServerArgs:
                         f"mm_process_config['{key}'] must be a dict, "
                         f"but got {type(self.mm_process_config[key])}"
                     )
-                    
-    if self.enable_http2:
-        try:
-            import granian  # noqa: F401
-        except ImportError:
-            raise ValueError(
-                "--enable-http2 requires the 'granian' package. "
-                'Install it with: pip install "sglang[http2]"'
-            )
-
-        if self.enable_ssl_refresh:
-            raise ValueError(
-                "--enable-ssl-refresh is not supported with --enable-http2. "
-                "Granian does not support SSL certificate hot-reloading. "
-                "Use Uvicorn (the default) or handle certificate rotation externally."
-            )
-
-        if self.tokenizer_worker_num > 1:
-            raise ValueError(
-                "--enable-http2 does not yet support --tokenizer-worker-num > 1. "
-                "Multi-worker HTTP/2 support will be added in a future release."
-            )
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
