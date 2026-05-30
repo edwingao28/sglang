@@ -660,7 +660,9 @@ def _slice_cpu_copy_for_suffix(kv_cache_cpu, skip_prefix_len: int):
 
         if isinstance(chunk, (list, tuple)) and len(chunk) == 2:
             k_cpu, v_cpu = chunk
-            if not isinstance(k_cpu, torch.Tensor) or not isinstance(v_cpu, torch.Tensor):
+            if not isinstance(k_cpu, torch.Tensor) or not isinstance(
+                v_cpu, torch.Tensor
+            ):
                 raise RuntimeError(
                     "Unsupported CPU KV copy chunk shape for suffix-only restore: "
                     f"{type(chunk)!r}"
@@ -717,7 +719,8 @@ def _slice_cpu_copy_for_suffix(kv_cache_cpu, skip_prefix_len: int):
         if chunk_kind == "mla":
             suffix = torch.cat(suffix_chunks, dim=0)
             return [
-                suffix[i : i + chunk_size] for i in range(0, suffix.shape[0], chunk_size)
+                suffix[i : i + chunk_size]
+                for i in range(0, suffix.shape[0], chunk_size)
             ]
 
         k_suffix = torch.cat([chunk[0] for chunk in suffix_chunks], dim=0)

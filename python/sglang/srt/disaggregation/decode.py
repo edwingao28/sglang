@@ -590,8 +590,7 @@ class DecodePreallocQueue:
             prefix_indices = None
             prefix_len = 0
             use_radix_for_req = (
-                radix_resume_enabled
-                and self._can_resume_with_radix_suffix_restore(req)
+                radix_resume_enabled and self._can_resume_with_radix_suffix_restore(req)
             )
 
             if use_radix_for_req:
@@ -609,9 +608,12 @@ class DecodePreallocQueue:
 
             if use_radix_for_req:
                 fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-                full_required = self._required_alloc_tokens(
-                    fill_len=fill_len, prefix_len=prefix_len
-                ) + self.num_reserved_decode_tokens
+                full_required = (
+                    self._required_alloc_tokens(
+                        fill_len=fill_len, prefix_len=prefix_len
+                    )
+                    + self.num_reserved_decode_tokens
+                )
                 swa_required = 0
             else:
                 full_required, swa_required = self._prealloc_required_tokens(req)
