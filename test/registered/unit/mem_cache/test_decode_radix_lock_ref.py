@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.managers.schedule_batch import Req, _slice_cpu_copy_for_suffix
 
 
 def _make_cache_with_pools(page_size=1):
@@ -342,6 +343,105 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         scheduler.enable_hisparse = False
         queue.scheduler = scheduler
         return queue, req, matched_node
+
+    def _flatten_mha_cpu_rows(self, layer_chunks, tensor_idx=0):
+        values = []
+        for chunk in layer_chunks:
+            values.extend(chunk[tensor_idx].flatten().tolist())
+        return values
+
+    def _make_mha_cpu_copy(self, num_rows=10):
+        def make_layer(k_start, v_start):
+            chunks = []
+            row_start = 0
+            for chunk_len in [4, 4, num_rows - 8]:
+                if chunk_len <= 0:
+                    continue
+                chunks.append(
+                    [
+                        torch.arange(
+                            k_start + row_start,
+                            k_start + row_start + chunk_len,
+                            dtype=torch.float32,
+                        ).reshape(chunk_len, 1),
+                        torch.arange(
+                            v_start + row_start,
+                            v_start + row_start + chunk_len,
+                            dtype=torch.float32,
+                        ).reshape(chunk_len, 1),
+                    ]
+                )
+                row_start += chunk_len
+            return chunks
+
+        return [
+            make_layer(0, 100),
+            make_layer(200, 300),
+        ]
+
+    def test_slice_cpu_copy_for_suffix_skips_source_rows_across_chunk_boundary(self):
+        cpu_copy = self._make_mha_cpu_copy()
+
+        sliced = _slice_cpu_copy_for_suffix(cpu_copy, skip_prefix_len=5)
+
+        self.assertEqual(self._flatten_mha_cpu_rows(sliced[0]), [5, 6, 7, 8, 9])
+        self.assertEqual(
+            self._flatten_mha_cpu_rows(sliced[0], tensor_idx=1),
+            [105, 106, 107, 108, 109],
+        )
+        self.assertEqual(
+            [chunk[0].shape[0] for chunk in sliced[0]],
+            [3, 2],
+        )
+        self.assertEqual(
+            self._flatten_mha_cpu_rows(sliced[1]),
+            [205, 206, 207, 208, 209],
+        )
+        self.assertEqual(
+            self._flatten_mha_cpu_rows(sliced[1], tensor_idx=1),
+            [305, 306, 307, 308, 309],
+        )
+
+    def test_req_load_kv_cache_restores_suffix_with_matching_source_offset(self):
+        req = SimpleNamespace()
+        req.req_pool_idx = 0
+        req.seqlen = 10
+        req.mamba_pool_idx = None
+        req.kv_cache_cpu = self._make_mha_cpu_copy(num_rows=req.seqlen - 1)
+
+        req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(20, dtype=torch.int64).reshape(2, 10)
+        )
+        allocator = MagicMock()
+
+        Req.load_kv_cache(
+            req,
+            req_to_token_pool,
+            allocator,
+            skip_prefix_len=5,
+        )
+
+        allocator.load_cpu_copy.assert_called_once()
+        restored_cpu_copy, restored_indices = allocator.load_cpu_copy.call_args.args[:2]
+        self.assertTrue(torch.equal(restored_indices, torch.arange(5, 9)))
+        self.assertIsNone(allocator.load_cpu_copy.call_args.kwargs["mamba_indices"])
+        self.assertEqual(
+            self._flatten_mha_cpu_rows(restored_cpu_copy[0]),
+            [5, 6, 7, 8],
+        )
+        self.assertEqual(
+            self._flatten_mha_cpu_rows(restored_cpu_copy[0], tensor_idx=1),
+            [105, 106, 107, 108],
+        )
+        self.assertEqual(
+            self._flatten_mha_cpu_rows(restored_cpu_copy[1]),
+            [205, 206, 207, 208],
+        )
+        self.assertEqual(
+            self._flatten_mha_cpu_rows(restored_cpu_copy[1], tensor_idx=1),
+            [305, 306, 307, 308],
+        )
+        self.assertFalse(hasattr(req, "kv_cache_cpu"))
 
     def _pre_alloc_call(self, queue):
         args = queue._pre_alloc.call_args.args
