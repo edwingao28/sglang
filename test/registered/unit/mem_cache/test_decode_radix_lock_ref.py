@@ -27,6 +27,7 @@ register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
@@ -288,6 +289,152 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertEqual(cache.root_node.lock_ref, root_lock_before)
         self.assertEqual(cache.protected_size(), 0)
         self.assertEqual(cache.evictable_size(), 0)
+
+    def _make_resume_queue(
+        self,
+        *,
+        prefix_indices,
+        prefix_len,
+        allocatable_tokens=64,
+        required_alloc_tokens=4,
+        enable_radix=True,
+    ):
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+
+        req = SimpleNamespace()
+        req.rid = "resume-req"
+        req.origin_input_ids = array("q", range(8))
+        req.output_ids = array("q", [101, 102])
+        req.seqlen = 10
+        req.is_retracted = True
+        req.last_node = object()
+        req.last_host_node = None
+        req.best_match_node = None
+        req.host_hit_length = 0
+        req.cache_protected_len = 0
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        req.mamba_pool_idx = None
+        req.load_kv_cache = MagicMock()
+
+        matched_node = object()
+
+        queue.retracted_queue = [req]
+        queue.req_to_token_pool = MagicMock()
+        queue.req_to_token_pool.available_size.return_value = 1
+        queue.token_to_kv_pool_allocator = MagicMock()
+        queue.token_to_kv_pool_allocator.page_size = 4
+        queue.tree_cache = MagicMock()
+        queue.tree_cache.dec_lock_ref = MagicMock()
+        queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        queue._allocatable_token_budgets = MagicMock(return_value=allocatable_tokens)
+        queue._prealloc_required_tokens = MagicMock(return_value=(9, 0))
+        queue._required_alloc_tokens = MagicMock(return_value=required_alloc_tokens)
+
+        def match_prefix_and_lock(req):
+            req.last_node = matched_node
+            return prefix_indices, prefix_len
+
+        queue._match_prefix_and_lock = MagicMock(side_effect=match_prefix_and_lock)
+        queue._pre_alloc = MagicMock()
+
+        scheduler = MagicMock()
+        scheduler.server_args.disaggregation_decode_enable_radix_cache = enable_radix
+        scheduler.enable_hisparse = False
+        queue.scheduler = scheduler
+        return queue, req, matched_node
+
+    def _pre_alloc_call(self, queue):
+        args = queue._pre_alloc.call_args.args
+        kwargs = queue._pre_alloc.call_args.kwargs
+        return (
+            kwargs.get("req", args[0] if len(args) > 0 else None),
+            kwargs.get("prefix_indices", args[1] if len(args) > 1 else None),
+            kwargs.get("prefix_len", args[2] if len(args) > 2 else None),
+        )
+
+    def test_resume_retracted_req_uses_radix_prefix_and_suffix_restore(self):
+        prefix_indices = torch.arange(4, dtype=torch.int64)
+        queue, req, _ = self._make_resume_queue(
+            prefix_indices=prefix_indices,
+            prefix_len=4,
+            allocatable_tokens=5,
+            required_alloc_tokens=5,
+        )
+
+        resumed = queue.resume_retracted_reqs()
+
+        self.assertEqual(resumed, [req])
+        self.assertEqual(queue.retracted_queue, [])
+        queue._match_prefix_and_lock.assert_called_once_with(req)
+        (
+            alloc_req,
+            alloc_prefix_indices,
+            alloc_prefix_len,
+        ) = self._pre_alloc_call(queue)
+        self.assertIs(alloc_req, req)
+        self.assertIsNotNone(alloc_prefix_indices)
+        self.assertTrue(torch.equal(alloc_prefix_indices, prefix_indices))
+        self.assertEqual(alloc_prefix_len, 4)
+        queue._required_alloc_tokens.assert_called_once_with(fill_len=9, prefix_len=4)
+        self.assertEqual(req.cache_protected_len, 4)
+        req.load_kv_cache.assert_called_once_with(
+            queue.req_to_token_pool,
+            queue.token_to_kv_pool_allocator,
+            skip_prefix_len=4,
+        )
+        queue.tree_cache.dec_lock_ref.assert_not_called()
+        self.assertFalse(req.is_retracted)
+
+    def test_resume_retracted_req_unlocks_prefix_when_post_lock_budget_fails(self):
+        prefix_indices = torch.arange(4, dtype=torch.int64)
+        queue, req, matched_node = self._make_resume_queue(
+            prefix_indices=prefix_indices,
+            prefix_len=4,
+            allocatable_tokens=3,
+            required_alloc_tokens=5,
+        )
+
+        resumed = queue.resume_retracted_reqs()
+
+        self.assertEqual(resumed, [])
+        self.assertEqual(queue.retracted_queue, [req])
+        queue._match_prefix_and_lock.assert_called_once_with(req)
+        queue._pre_alloc.assert_not_called()
+        req.load_kv_cache.assert_not_called()
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(matched_node)
+        self.assertTrue(req.is_retracted)
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertEqual(len(req.prefix_indices), 0)
+        self.assertIsNone(req.last_node)
+
+    def test_resume_retracted_req_zero_prefix_keeps_full_restore_path(self):
+        prefix_indices = torch.empty((0,), dtype=torch.int64)
+        queue, req, _ = self._make_resume_queue(
+            prefix_indices=prefix_indices,
+            prefix_len=0,
+            allocatable_tokens=64,
+            required_alloc_tokens=9,
+        )
+
+        resumed = queue.resume_retracted_reqs()
+
+        self.assertEqual(resumed, [req])
+        (
+            alloc_req,
+            alloc_prefix_indices,
+            alloc_prefix_len,
+        ) = self._pre_alloc_call(queue)
+        self.assertIs(alloc_req, req)
+        self.assertIsNotNone(alloc_prefix_indices)
+        self.assertTrue(torch.equal(alloc_prefix_indices, prefix_indices))
+        self.assertEqual(alloc_prefix_len, 0)
+        self.assertEqual(req.cache_protected_len, 0)
+        req.load_kv_cache.assert_called_once_with(
+            queue.req_to_token_pool,
+            queue.token_to_kv_pool_allocator,
+            skip_prefix_len=0,
+        )
+        queue.tree_cache.dec_lock_ref.assert_not_called()
 
     def test_pop_preallocated_rechecks_budget_after_lock(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
