@@ -638,6 +638,98 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+def _slice_cpu_copy_for_suffix(kv_cache_cpu, skip_prefix_len: int):
+    if skip_prefix_len <= 0:
+        return kv_cache_cpu
+
+    if isinstance(kv_cache_cpu, dict):
+        raise RuntimeError(
+            "Suffix-only restore is not enabled for dict CPU KV copies; "
+            "SWA/hybrid pools should use full restore semantics."
+        )
+
+    if not isinstance(kv_cache_cpu, list):
+        raise RuntimeError(
+            "Unsupported CPU KV copy type for suffix-only restore: "
+            f"{type(kv_cache_cpu)!r}"
+        )
+
+    def get_chunk_kind_and_size(chunk):
+        if isinstance(chunk, torch.Tensor):
+            return "mla", chunk.shape[0]
+
+        if isinstance(chunk, (list, tuple)) and len(chunk) == 2:
+            k_cpu, v_cpu = chunk
+            if not isinstance(k_cpu, torch.Tensor) or not isinstance(v_cpu, torch.Tensor):
+                raise RuntimeError(
+                    "Unsupported CPU KV copy chunk shape for suffix-only restore: "
+                    f"{type(chunk)!r}"
+                )
+            return "mha", k_cpu.shape[0]
+
+        raise RuntimeError(
+            f"Unsupported CPU KV copy chunk type for suffix-only restore: {type(chunk)!r}"
+        )
+
+    def infer_chunk_size():
+        for layer_chunks in kv_cache_cpu:
+            if layer_chunks:
+                _, chunk_size = get_chunk_kind_and_size(layer_chunks[0])
+                return chunk_size
+        return 0
+
+    chunk_size = infer_chunk_size()
+
+    def slice_layer_chunks(layer_chunks):
+        remaining_skip = skip_prefix_len
+        suffix_chunks = []
+        chunk_kind = None
+
+        for chunk in layer_chunks:
+            current_kind, chunk_len = get_chunk_kind_and_size(chunk)
+            if chunk_kind is None:
+                chunk_kind = current_kind
+            elif chunk_kind != current_kind:
+                raise RuntimeError(
+                    "Mixed CPU KV copy chunk shapes are unsupported for suffix-only restore."
+                )
+
+            if current_kind == "mla":
+                if remaining_skip >= chunk_len:
+                    remaining_skip -= chunk_len
+                    continue
+
+                suffix_chunks.append(chunk[remaining_skip:])
+                remaining_skip = 0
+                continue
+
+            k_cpu, v_cpu = chunk
+            if remaining_skip >= chunk_len:
+                remaining_skip -= chunk_len
+                continue
+
+            suffix_chunks.append((k_cpu[remaining_skip:], v_cpu[remaining_skip:]))
+            remaining_skip = 0
+
+        if not suffix_chunks:
+            return []
+
+        if chunk_kind == "mla":
+            suffix = torch.cat(suffix_chunks, dim=0)
+            return [
+                suffix[i : i + chunk_size] for i in range(0, suffix.shape[0], chunk_size)
+            ]
+
+        k_suffix = torch.cat([chunk[0] for chunk in suffix_chunks], dim=0)
+        v_suffix = torch.cat([chunk[1] for chunk in suffix_chunks], dim=0)
+        return [
+            [k_suffix[i : i + chunk_size], v_suffix[i : i + chunk_size]]
+            for i in range(0, k_suffix.shape[0], chunk_size)
+        ]
+
+    return [slice_layer_chunks(layer_chunks) for layer_chunks in kv_cache_cpu]
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -1351,13 +1443,35 @@ class Req(ReqDllmMixin):
             token_indices, mamba_indices=self.mamba_pool_idx
         )
 
-    def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
+    def load_kv_cache(
+        self,
+        req_to_token_pool,
+        token_to_kv_pool_allocator,
+        *,
+        skip_prefix_len: int = 0,
+    ):
         token_indices = req_to_token_pool.req_to_token[
-            self.req_pool_idx, : self.seqlen - 1
+            self.req_pool_idx, skip_prefix_len : self.seqlen - 1
         ]
+        if skip_prefix_len > 0 and self.mamba_pool_idx is not None:
+            raise RuntimeError(
+                "Suffix-only restore is not enabled for Mamba state; "
+                "Mamba requests should use full restore semantics."
+            )
+
+        kv_cache_cpu = (
+            _slice_cpu_copy_for_suffix(self.kv_cache_cpu, skip_prefix_len)
+            if skip_prefix_len > 0
+            else self.kv_cache_cpu
+        )
+
+        if skip_prefix_len > 0 and len(token_indices) == 0:
+            del self.kv_cache_cpu
+            return
+
         # Loads both the kv cache and mamba state if exists
         token_to_kv_pool_allocator.load_cpu_copy(
-            self.kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
+            kv_cache_cpu, token_indices, mamba_indices=self.mamba_pool_idx
         )
         del self.kv_cache_cpu
 

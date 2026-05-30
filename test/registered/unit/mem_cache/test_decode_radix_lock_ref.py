@@ -391,7 +391,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         )
         self.assertEqual(
             [chunk[0].shape[0] for chunk in sliced[0]],
-            [3, 2],
+            [4, 1],
         )
         self.assertEqual(
             self._flatten_mha_cpu_rows(sliced[1]),
@@ -434,12 +434,20 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
             [105, 106, 107, 108],
         )
         self.assertEqual(
+            [chunk[0].shape[0] for chunk in restored_cpu_copy[0]],
+            [4],
+        )
+        self.assertEqual(
             self._flatten_mha_cpu_rows(restored_cpu_copy[1]),
             [205, 206, 207, 208],
         )
         self.assertEqual(
             self._flatten_mha_cpu_rows(restored_cpu_copy[1], tensor_idx=1),
             [305, 306, 307, 308],
+        )
+        self.assertEqual(
+            [chunk[0].shape[0] for chunk in restored_cpu_copy[1]],
+            [4],
         )
         self.assertFalse(hasattr(req, "kv_cache_cpu"))
 
