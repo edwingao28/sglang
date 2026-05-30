@@ -477,6 +477,22 @@ class DecodePreallocQueue:
 
         return prefix_indices, len(prefix_indices)
 
+    def _clear_resume_prefix_match(self, req: Req) -> None:
+        """Release and clear a resume-time radix match that will not be used."""
+        if req.last_node is not None:
+            self.tree_cache.dec_lock_ref(req.last_node)
+        req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        req.last_node = None
+        req.last_host_node = None
+        req.best_match_node = None
+        req.host_hit_length = 0
+        req.cache_protected_len = 0
+
+    def _can_resume_with_radix_suffix_restore(self, req: Req) -> bool:
+        if getattr(req, "mamba_pool_idx", None) is not None:
+            return False
+        return isinstance(getattr(req, "kv_cache_cpu", None), list)
+
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
@@ -558,6 +574,11 @@ class DecodePreallocQueue:
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False
             )
+        radix_resume_enabled = (
+            self.scheduler.server_args.disaggregation_decode_enable_radix_cache
+            and not self.scheduler.enable_hisparse
+            and not uses_swa_tail_prealloc
+        )
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
@@ -566,22 +587,71 @@ class DecodePreallocQueue:
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            full_required, swa_required = self._prealloc_required_tokens(req)
+            prefix_indices = None
+            prefix_len = 0
+            use_radix_for_req = (
+                radix_resume_enabled
+                and self._can_resume_with_radix_suffix_restore(req)
+            )
+
+            if use_radix_for_req:
+                prefix_indices, prefix_len = self._match_prefix_and_lock(req)
+                page_size = self.token_to_kv_pool_allocator.page_size
+                if page_size > 1 and prefix_len % page_size != 0:
+                    prefix_len = page_align_floor(prefix_len, page_size)
+                    prefix_indices = prefix_indices[:prefix_len]
+
+                if getattr(req, "host_hit_length", 0) > 0:
+                    self._clear_resume_prefix_match(req)
+                    prefix_indices = None
+                    prefix_len = 0
+                    use_radix_for_req = False
+
+            if use_radix_for_req:
+                fill_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+                full_required = self._required_alloc_tokens(
+                    fill_len=fill_len, prefix_len=prefix_len
+                ) + self.num_reserved_decode_tokens
+                swa_required = 0
+            else:
+                full_required, swa_required = self._prealloc_required_tokens(req)
+
             if full_required > full_allocatable_tokens:
+                if use_radix_for_req:
+                    self._clear_resume_prefix_match(req)
                 break
             if uses_swa_tail_prealloc and swa_required > swa_allocatable_tokens:
+                if use_radix_for_req:
+                    self._clear_resume_prefix_match(req)
                 break
 
-            resumed_reqs.append(req)
-            indices_to_remove.add(i)
             req.is_retracted = False
-            self._pre_alloc(req)
+            try:
+                self._pre_alloc(req, prefix_indices, prefix_len)
+            except Exception:
+                req.is_retracted = True
+                if use_radix_for_req:
+                    self._clear_resume_prefix_match(req)
+                raise
+            req.cache_protected_len = prefix_len
             full_allocatable_tokens -= full_required
             if uses_swa_tail_prealloc:
                 swa_allocatable_tokens -= swa_required
 
             # load from cpu, release the cpu copy
-            req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
+            try:
+                req.load_kv_cache(
+                    self.req_to_token_pool,
+                    self.token_to_kv_pool_allocator,
+                    skip_prefix_len=prefix_len,
+                )
+            except Exception:
+                req.is_retracted = True
+                if use_radix_for_req:
+                    self._clear_resume_prefix_match(req)
+                raise
+            resumed_reqs.append(req)
+            indices_to_remove.add(i)
 
         self.retracted_queue = [
             entry
@@ -1209,9 +1279,6 @@ class DecodePreallocQueue:
                 (req.req_pool_idx, slice(0, prefix_len)), prefix_indices
             )
 
-        # TODO(retraction): when retraction is implemented with radix cache
-        # awareness, a retracted request should re-match the tree here
-        # instead of re-allocating from scratch. See resume_retracted_reqs.
         delta_len = fill_len - prefix_len
         required_alloc_tokens = self._required_alloc_tokens(
             fill_len=fill_len, prefix_len=prefix_len

@@ -299,6 +299,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         allocatable_tokens=64,
         required_alloc_tokens=4,
         enable_radix=True,
+        num_reserved_decode_tokens=1,
     ):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
 
@@ -315,6 +316,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         req.cache_protected_len = 0
         req.prefix_indices = torch.empty((0,), dtype=torch.int64)
         req.mamba_pool_idx = None
+        req.kv_cache_cpu = self._make_mha_cpu_copy(num_rows=req.seqlen - 1)
         req.load_kv_cache = MagicMock()
 
         matched_node = object()
@@ -330,6 +332,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue._allocatable_token_budgets = MagicMock(return_value=allocatable_tokens)
         queue._prealloc_required_tokens = MagicMock(return_value=(9, 0))
         queue._required_alloc_tokens = MagicMock(return_value=required_alloc_tokens)
+        queue.num_reserved_decode_tokens = num_reserved_decode_tokens
 
         def match_prefix_and_lock(req):
             req.last_node = matched_node
@@ -465,8 +468,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue, req, _ = self._make_resume_queue(
             prefix_indices=prefix_indices,
             prefix_len=4,
-            allocatable_tokens=5,
+            allocatable_tokens=6,
             required_alloc_tokens=5,
+            num_reserved_decode_tokens=1,
         )
 
         resumed = queue.resume_retracted_reqs()
@@ -484,6 +488,7 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         self.assertTrue(torch.equal(alloc_prefix_indices, prefix_indices))
         self.assertEqual(alloc_prefix_len, 4)
         queue._required_alloc_tokens.assert_called_once_with(fill_len=9, prefix_len=4)
+        queue._prealloc_required_tokens.assert_not_called()
         self.assertEqual(req.cache_protected_len, 4)
         req.load_kv_cache.assert_called_once_with(
             queue.req_to_token_pool,
@@ -498,8 +503,9 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue, req, matched_node = self._make_resume_queue(
             prefix_indices=prefix_indices,
             prefix_len=4,
-            allocatable_tokens=3,
+            allocatable_tokens=5,
             required_alloc_tokens=5,
+            num_reserved_decode_tokens=1,
         )
 
         resumed = queue.resume_retracted_reqs()
@@ -509,6 +515,80 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         queue._match_prefix_and_lock.assert_called_once_with(req)
         queue._pre_alloc.assert_not_called()
         req.load_kv_cache.assert_not_called()
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(matched_node)
+        self.assertTrue(req.is_retracted)
+        self.assertEqual(req.cache_protected_len, 0)
+        self.assertEqual(len(req.prefix_indices), 0)
+        self.assertIsNone(req.last_node)
+
+    def test_resume_retracted_req_radix_budget_includes_decode_reserve(self):
+        prefix_indices = torch.arange(4, dtype=torch.int64)
+        queue, req, matched_node = self._make_resume_queue(
+            prefix_indices=prefix_indices,
+            prefix_len=4,
+            allocatable_tokens=5,
+            required_alloc_tokens=5,
+            num_reserved_decode_tokens=1,
+        )
+
+        resumed = queue.resume_retracted_reqs()
+
+        self.assertEqual(resumed, [])
+        self.assertEqual(queue.retracted_queue, [req])
+        queue._required_alloc_tokens.assert_called_once_with(fill_len=9, prefix_len=4)
+        queue._pre_alloc.assert_not_called()
+        queue.tree_cache.dec_lock_ref.assert_called_once_with(matched_node)
+        self.assertTrue(req.is_retracted)
+        self.assertEqual(req.cache_protected_len, 0)
+
+    def test_resume_retracted_req_hybrid_cpu_copy_uses_full_restore_path(self):
+        prefix_indices = torch.arange(4, dtype=torch.int64)
+        queue, req, matched_node = self._make_resume_queue(
+            prefix_indices=prefix_indices,
+            prefix_len=4,
+            allocatable_tokens=64,
+            required_alloc_tokens=5,
+        )
+        req.kv_cache_cpu = (self._make_mha_cpu_copy(), ("mamba-conv", "mamba-state"))
+
+        resumed = queue.resume_retracted_reqs()
+
+        self.assertEqual(resumed, [req])
+        queue._match_prefix_and_lock.assert_not_called()
+        queue.tree_cache.dec_lock_ref.assert_not_called()
+        (
+            alloc_req,
+            alloc_prefix_indices,
+            alloc_prefix_len,
+        ) = self._pre_alloc_call(queue)
+        self.assertIs(alloc_req, req)
+        self.assertIsNone(alloc_prefix_indices)
+        self.assertEqual(alloc_prefix_len, 0)
+        queue._prealloc_required_tokens.assert_called_once_with(req)
+        queue._required_alloc_tokens.assert_not_called()
+        req.load_kv_cache.assert_called_once_with(
+            queue.req_to_token_pool,
+            queue.token_to_kv_pool_allocator,
+            skip_prefix_len=0,
+        )
+        self.assertFalse(req.is_retracted)
+        self.assertEqual(req.cache_protected_len, 0)
+
+    def test_resume_retracted_req_load_failure_clears_radix_prefix_lock(self):
+        prefix_indices = torch.arange(4, dtype=torch.int64)
+        queue, req, matched_node = self._make_resume_queue(
+            prefix_indices=prefix_indices,
+            prefix_len=4,
+            allocatable_tokens=64,
+            required_alloc_tokens=5,
+        )
+        req.load_kv_cache.side_effect = RuntimeError("load failed")
+
+        with self.assertRaisesRegex(RuntimeError, "load failed"):
+            queue.resume_retracted_reqs()
+
+        self.assertEqual(queue.retracted_queue, [req])
+        queue._pre_alloc.assert_called_once()
         queue.tree_cache.dec_lock_ref.assert_called_once_with(matched_node)
         self.assertTrue(req.is_retracted)
         self.assertEqual(req.cache_protected_len, 0)
