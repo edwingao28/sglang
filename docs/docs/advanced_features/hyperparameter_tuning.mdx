@@ -25,6 +25,7 @@ However, avoid making `#queue-req` too large, as this will increase the scheduli
 
 If you frequently see `token usage < 0.9` and `#queue-req > 0`, it means the server is too conservative about taking in new requests. You can decrease `--schedule-conservativeness` to a value like 0.3.
 The case of a server being too conservative can happen when users send many requests with a large `max_new_tokens` but the requests stop very early due to EOS or stop strings.
+In that case the scheduler reserves `min(max_new_tokens, --clip-max-new-tokens-estimation)` KV tokens for every new request (default 4096), which caps how many requests it admits at once regardless of `--schedule-conservativeness`. Lower `--clip-max-new-tokens-estimation` (e.g. 256) when outputs are usually short; the stop condition is unchanged and an under-estimate is handled by retraction.
 
 On the other hand, if you see `token usage` very high and you frequently see warnings like
 `KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_token_ratio: 0.9998 -> 1.0000`, you can increase `--schedule-conservativeness` to a value like 1.3.

@@ -694,6 +694,21 @@ def handle_prefill_delayer_env_compat(server_args: Any):
         )
 
 
+def handle_clip_max_new_tokens_estimation_env_compat(server_args: Any):
+    if not envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.is_set():
+        return
+    logger.warning(
+        "SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION is deprecated; use "
+        "--clip-max-new-tokens-estimation instead."
+    )
+    if resolving_view(server_args).clip_max_new_tokens_estimation is None:
+        declare_resolution(
+            server_args,
+            "_handle_clip_max_new_tokens_estimation_env_compat",
+            clip_max_new_tokens_estimation=envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get(),
+        )
+
+
 def handle_tokenizer_batching(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.enable_tokenizer_batch_encode and cfg.enable_dynamic_batch_tokenizer:

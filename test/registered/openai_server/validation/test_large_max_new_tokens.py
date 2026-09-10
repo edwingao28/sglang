@@ -51,8 +51,9 @@ class TestLargeMaxNewTokens(CustomTestCase):
                 "8192",
                 "--decode-log-interval",
                 "2",
+                "--clip-max-new-tokens-estimation",
+                "256",
             ),
-            env={"SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION": "256", **os.environ},
             return_stdout_stderr=(cls.stdout, cls.stderr),
         )
         cls.base_url += "/v1"

@@ -202,6 +202,7 @@ class SchedulerDllmMixin:
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=get_schedule().prefill_max_requests,
+            clip_max_new_tokens=get_schedule().clip_max_new_tokens_estimation,
             dllm_config=self.dllm_config,
         )
 

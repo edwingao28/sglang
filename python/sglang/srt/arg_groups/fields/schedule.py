@@ -139,6 +139,22 @@ class Schedule:
         float,
         "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
     ] = 1.0
+    clip_max_new_tokens_estimation: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Clip the per-request max_new_tokens the scheduler uses when it "
+                "estimates how many KV tokens a new request needs. Only the "
+                "estimate is clipped; the stop condition is unchanged, so a "
+                "request still generates up to its own max_new_tokens. Lower it "
+                "when requests carry a large max_new_tokens but usually stop "
+                "early, so more of them are admitted at once. Unset reads the "
+                "deprecated SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION env var."
+            ),
+            resolvable=True,
+            fallback=4096,
+        ),
+    ] = None
     page_size: A[
         Optional[int], Arg(help="The number of tokens in a page.", resolvable=True)
     ] = None

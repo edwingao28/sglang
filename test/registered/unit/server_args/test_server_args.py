@@ -3051,5 +3051,39 @@ class TestNoneMeansUnset(CustomTestCase):
         self.assertIsNotNone(server_args.mamba_full_memory_ratio)
 
 
+class TestClipMaxNewTokensEstimation(CustomTestCase):
+    FIELD = "clip_max_new_tokens_estimation"
+
+    def _resolved(self, *argv):
+        args = prepare_server_args(["--model-path", "dummy", *argv])
+        args.resolve_once()
+        return args
+
+    def test_unset_resolves_to_default(self):
+        with patch.dict(os.environ, clear=False):
+            os.environ.pop("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", None)
+            args = self._resolved()
+        self.assertIsNone(args.clip_max_new_tokens_estimation)
+        self.assertEqual(resolution_result(args, self.FIELD), 4096)
+
+    def test_flag_parses(self):
+        args = self._resolved("--clip-max-new-tokens-estimation", "128")
+        self.assertEqual(resolution_result(args, self.FIELD), 128)
+
+    def test_env_fallback_resolves_with_deprecation_warning(self):
+        with envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.override(256):
+            with self.assertLogs(serving_hook.logger, level="WARNING") as logs:
+                args = self._resolved()
+        self.assertEqual(resolution_result(args, self.FIELD), 256)
+        self.assertTrue(
+            any("--clip-max-new-tokens-estimation" in m for m in logs.output)
+        )
+
+    def test_flag_wins_over_env(self):
+        with envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.override(256):
+            args = self._resolved("--clip-max-new-tokens-estimation", "128")
+        self.assertEqual(resolution_result(args, self.FIELD), 128)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -131,6 +131,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
+        queue.clip_max_new_tokens = 4096
         # `pop_preallocated` credits this counter; `__new__` skips the __init__
         # that seeds it.
         queue._num_published_destinations = 0
@@ -183,8 +184,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         ]
         queue = self._new_queue(reqs)
 
-        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
-            preallocated, failed = queue.pop_preallocated()
+        preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated],
@@ -204,8 +204,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         ]
         queue = self._new_queue(reqs, low_priority_values_first=True)
 
-        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
-            preallocated, failed = queue.pop_preallocated()
+        preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated],
@@ -222,8 +221,7 @@ class TestDecodePreallocQueuePriority(unittest.TestCase):
         healthy_high = self._new_decode_req("healthy-high", 10)
         queue = self._new_queue([failed_low, healthy_high])
 
-        with patch("sglang.srt.disaggregation.decode.CLIP_MAX_NEW_TOKEN", 4096):
-            preallocated, failed = queue.pop_preallocated()
+        preallocated, failed = queue.pop_preallocated()
 
         self.assertEqual(
             [decode_req.req.rid for decode_req in preallocated], ["healthy-high"]

@@ -67,6 +67,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     handle_mega_moe(server_args)
     from sglang.srt.arg_groups.serving_hook import (
         handle_asr_validation,
+        handle_clip_max_new_tokens_estimation_env_compat,
         handle_crash_dump_env,
         handle_debug_utils,
         handle_deprecated_args,
@@ -100,6 +101,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     validate_prefill_decode_interval(server_args)
+    handle_clip_max_new_tokens_estimation_env_compat(server_args)
 
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.

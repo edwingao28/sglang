@@ -70,14 +70,6 @@ from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
-# Clip the estimation of max_new_tokens for the request whose max_new_tokens is very large.
-# This can prevent the server from being too conservative.
-# Note that this only clips the estimation in the scheduler but does not change the stop
-# condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS = int(
-    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
-)
-
 # Threshold for in-batch prefix cache.
 # If a request has a matched prefix length (against existing cache) less than this value,
 # the scheduler runs the in-batch prefix caching check for this request.
@@ -553,9 +545,11 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        clip_max_new_tokens: int = 4096,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
+        self.clip_max_new_tokens = clip_max_new_tokens
         self.tree_cache = tree_cache
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         # Per-request SWA ring: one fixed slot per request, not a token budget.
@@ -688,7 +682,7 @@ class PrefillAdder:
         return (
             min(
                 (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
+                self.clip_max_new_tokens,
             )
             * self.new_token_ratio
         )
@@ -811,7 +805,7 @@ class PrefillAdder:
         still has a long decode ahead, under-reserving its window."""
         return min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+            self.clip_max_new_tokens,
         )
 
     def _swa_chunk_cap(self, max_new_tokens: int, swa_host_hit_length: int = 0) -> int:
@@ -1039,7 +1033,7 @@ class PrefillAdder:
 
         # Update budget: reserve max_new_tokens only if not truncated
         max_new_tokens = (
-            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            min(req.sampling_params.max_new_tokens, self.clip_max_new_tokens)
             if not truncated
             else 0
         )
@@ -1099,7 +1093,7 @@ class PrefillAdder:
             0,
             req.extend_range.length,
             (
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                min(req.sampling_params.max_new_tokens, self.clip_max_new_tokens)
                 if not truncated
                 else 0
             ),
@@ -1233,7 +1227,7 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_range.length,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                min(req.sampling_params.max_new_tokens, self.clip_max_new_tokens),
                 req.retracted_stain,
                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
             )
@@ -1277,7 +1271,7 @@ class PrefillAdder:
         # _update_prefill_budget also deducts.
         max_new = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+            self.clip_max_new_tokens,
         )
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
             req.prefix_indices
@@ -1442,7 +1436,7 @@ class PrefillAdder:
                     input_tokens,
                     min(
                         req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
+                        self.clip_max_new_tokens,
                     ),
                     req.retracted_stain,
                     mamba_gap_reserve=mamba_gap_reserve,
@@ -1530,7 +1524,7 @@ class PrefillAdder:
         min_tokens_to_remove = (
             len(req.full_untruncated_fill_ids)
             - len(req.prefix_indices)
-            + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            + min(req.sampling_params.max_new_tokens, self.clip_max_new_tokens)
             - self.rem_total_tokens
         )
         for running_req in sorted_valid_running_reqs:

@@ -107,6 +107,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_schedule,
 )
 from sglang.srt.utils import ceil_align, get_num_new_pages, is_npu
 from sglang.srt.utils.network import NetworkAddress
@@ -119,8 +120,6 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
-
-CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
 def _bootstrap_addr(req: Req) -> str:
@@ -380,6 +379,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.pp_size = scheduler.ps.pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
+        self.clip_max_new_tokens = get_schedule().clip_max_new_tokens_estimation
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
@@ -1282,7 +1282,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     - prefix_len
                     + min(
                         decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
+                        self.clip_max_new_tokens,
                     )
                     - retractable_tokens,
                 )
@@ -1301,7 +1301,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 _, swa_len = self._prealloc_kv_lens(decode_req.req)
                 max_new_tokens = min(
                     decode_req.req.sampling_params.max_new_tokens,
-                    CLIP_MAX_NEW_TOKEN,
+                    self.clip_max_new_tokens,
                 )
                 if (
                     max(
@@ -1580,7 +1580,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         need_space_for_single_req = (
             max(
                 [
-                    min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                    min(x.sampling_params.max_new_tokens, self.clip_max_new_tokens)
                     + len(x.origin_input_ids)
                     - retractable_tokens
                     for x in self.scheduler.running_batch.reqs
@@ -1704,7 +1704,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ):
             need_swa_space_for_single_req = max(
                 self._swa_tail_len(len(x.origin_input_ids))
-                + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                + min(x.sampling_params.max_new_tokens, self.clip_max_new_tokens)
                 - retractable_swa_tokens
                 for x in self.scheduler.running_batch.reqs
             )

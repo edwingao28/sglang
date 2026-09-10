@@ -655,9 +655,8 @@ class TestPrefillAdder(CustomTestCase):
         # out a request that has already generated >= CLIP tokens but still has a
         # long decode ahead, under-reserving its SWA window -> OOM risk on resume
         # of a long-generation request.
-        from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS as CLIP
-
         adder = self.create_adder(self.create_running_batch())
+        CLIP = adder.clip_max_new_tokens
         cases = [
             # (max_new, generated, expected, label)
             (100, 10, 90, "below_clip_normal"),
@@ -673,6 +672,32 @@ class TestPrefillAdder(CustomTestCase):
                     label, priority=0, max_new_tokens=max_new, output_len=generated
                 )
                 self.assertEqual(adder._swa_new_tokens(req), expected)
+
+    def test_clip_max_new_tokens_bounds_admitted_requests(self):
+        POOL, INPUT, MAX_NEW, NUM_REQS = 33_377, 128, 4096, 64
+        for clip, expected in ((4096, 7), (256, NUM_REQS)):
+            with self.subTest(clip=clip):
+                self.mock_token_allocator.available_size.return_value = POOL
+                self.mock_token_allocator.full_available_size.return_value = POOL
+                adder = self.create_adder(
+                    self.create_running_batch(), clip_max_new_tokens=clip
+                )
+                for _ in range(NUM_REQS):
+                    req = self._create_delayer_req(INPUT)
+                    req.sampling_params.max_new_tokens = MAX_NEW
+                    adder.add_one_req(
+                        req, has_chunked_req=False, truncation_align_size=None
+                    )
+                self.assertEqual(len(adder.can_run_list), expected)
+
+    def test_clip_max_new_tokens_bounds_running_request_offset(self):
+        running = self.create_mock_req(
+            "run", priority=0, max_new_tokens=5000, output_len=100
+        )
+        adder = self.create_adder(
+            self.create_running_batch([running]), clip_max_new_tokens=256
+        )
+        self.assertEqual(adder.rem_total_token_offset, 256)
 
     def test_delayer_not_consulted_when_kv_budget_rejects(self):
         """A rank whose first candidate fails the KV-budget gate must NOT

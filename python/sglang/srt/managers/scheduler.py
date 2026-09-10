@@ -3788,6 +3788,7 @@ class Scheduler(
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
             prefill_max_requests=get_schedule().prefill_max_requests,
+            clip_max_new_tokens=get_schedule().clip_max_new_tokens_estimation,
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
